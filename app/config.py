@@ -32,15 +32,16 @@ def _load_env_once() -> None:
         _ENV_LOADED = True
 
 
-def _require(name: str) -> str:
+def _require(name: str, help_text: str | None = None) -> str:
     value = os.getenv(name, "").strip()
-    if not value:
-        raise ConfigError(f"Missing required environment variable: {name}")
-    return value
+    if value:
+        return value
+    hint = f" {help_text}" if help_text else ""
+    raise ConfigError(f"Missing required environment variable: {name}.{hint}")
 
 
-def _require_int(name: str) -> int:
-    raw = _require(name)
+def _require_int(name: str, help_text: str | None = None) -> int:
+    raw = _require(name, help_text)
     try:
         return int(raw)
     except ValueError as exc:
@@ -50,12 +51,12 @@ def _require_int(name: str) -> int:
 def load_settings() -> Settings:
     _load_env_once()
     return Settings(
-        managebac_token=_require("MANAGEBAC_TOKEN"),
-        managebac_base_url=_require("MANAGEBAC_BASE_URL").rstrip("/"),
+        managebac_token=_require("MANAGEBAC_TOKEN", "Set your ManageBac API token in .env."),
+        managebac_base_url=_require("MANAGEBAC_BASE_URL", "Example: https://api.managebac.cn").rstrip("/"),
         report_timezone=os.getenv("REPORT_TIMEZONE", "Asia/Shanghai").strip() or "Asia/Shanghai",
-        homeroom_advisor_id=_require_int("HOMEROOM_ADVISOR_ID"),
-        target_graduating_year=_require_int("TARGET_GRADUATING_YEAR"),
-        term_id=os.getenv("TERM_ID", "106673").strip(),
+        homeroom_advisor_id=_require_int("HOMEROOM_ADVISOR_ID", "Use the advisor numeric ID."),
+        target_graduating_year=_require_int("TARGET_GRADUATING_YEAR", "Example: 2028."),
+        term_id=_require("TERM_ID", "Use the active term id used by your school in ManageBac."),
     )
 
 

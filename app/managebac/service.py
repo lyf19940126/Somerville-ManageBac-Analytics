@@ -10,7 +10,6 @@ from app.managebac.client import ManageBacClient
 logger = logging.getLogger(__name__)
 
 ENDPOINTS = {
-    "year_groups_list": "/v2/year-groups",
     "students_list": "/v2/students",
     "behaviour_notes": "/v2/behavior/notes",
     "classes_list": "/v2/classes",
@@ -35,64 +34,46 @@ class ManageBacService:
                     return value
         return []
 
-    def fetch_year_groups(self, page: int = 1, per_page: int = 100) -> list[dict[str, Any]]:
+    def fetch_students_by_advisor(self, advisor_id: int, page: int = 1, per_page: int = 200) -> list[dict[str, Any]]:
         payload = self.client.request(
             "GET",
-            ENDPOINTS["year_groups_list"],
-            params={"page": page, "per_page": per_page},
+            ENDPOINTS["students_list"],
+            params={
+                "homeroom_advisor_ids": advisor_id,
+                "page": page,
+                "per_page": per_page,
+            },
         )
-        return self._extract_list(payload, ("year_groups", "data", "items"))
+        return self._extract_list(payload, ("students", "data", "items"))
 
-    def list_students_for_homeroom(
+    def select_target_students(
         self,
         advisor_id: int,
         target_graduating_year: int,
+        include_archived: bool | None = None,
         per_page: int = 200,
     ) -> list[dict[str, Any]]:
         page = 1
         selected: list[dict[str, Any]] = []
 
         while True:
-            payload = self.client.request(
-                "GET",
-                ENDPOINTS["students_list"],
-                params={
-                    "homeroom_advisor_ids": advisor_id,
-                    "page": page,
-                    "per_page": per_page,
-                },
-            )
-            students = self._extract_list(payload, ("students", "data", "items"))
+            students = self.fetch_students_by_advisor(advisor_id=advisor_id, page=page, per_page=per_page)
             if not students:
                 break
 
             for student in students:
-                grad_year = student.get("graduating_year")
                 try:
-                    grad_year_int = int(grad_year)
+                    grad_year = int(student.get("graduating_year"))
                 except (TypeError, ValueError):
                     continue
-                if grad_year_int != target_graduating_year:
-                    continue
-                if student.get("archived") is True:
-                    continue
-                if student.get("graduated_on"):
+
+                if grad_year != target_graduating_year:
                     continue
 
-                sid = student.get("id") or student.get("student_id")
-                if sid is None:
+                if include_archived is False and student.get("archived") is True:
                     continue
-                selected.append(
-                    {
-                        "student_id": int(sid),
-                        "full_name": student.get("full_name")
-                        or " ".join(
-                            part for part in [student.get("first_name"), student.get("last_name")] if part
-                        ).strip(),
-                        "email": student.get("email"),
-                        "graduating_year": grad_year_int,
-                    }
-                )
+
+                selected.append(student)
 
             if len(students) < per_page:
                 break

@@ -46,6 +46,18 @@ def parse_datetime(value: str | None) -> datetime | None:
         return None
 
 
+def normalize_student(student: dict) -> tuple[int | None, str, str | None]:
+    raw_id = student.get("id") or student.get("student_id")
+    student_id = int(raw_id) if raw_id is not None else None
+    full_name = (
+        student.get("full_name")
+        or " ".join(part for part in [student.get("first_name"), student.get("last_name")] if part).strip()
+        or (f"Student {student_id}" if student_id is not None else "Student")
+    )
+    email = student.get("email")
+    return student_id, full_name, email
+
+
 def _normalize_overall(value):
     if isinstance(value, (int, float)):
         return float(value), None
@@ -68,93 +80,93 @@ def sync() -> None:
     counts = {"students": 0, "snapshots": 0, "behaviour": 0, "attendance": 0, "reports": 0}
 
     try:
-        students = service.list_students_for_homeroom(
-            advisor_id=settings.homeroom_advisor_id,
-            target_graduating_year=settings.target_graduating_year,
+        students = service.select_target_students(
+            settings.homeroom_advisor_id,
+            settings.target_graduating_year,
+            include_archived=False,
         )
-        student_ids = [s["student_id"] for s in students]
 
-        if students:
-            sample = students[0]
-            logger.info(
-                "Homeroom filtering complete: students=%s sample=(id=%s,name=%s,graduating_year=%s)",
-                len(students),
-                sample.get("student_id"),
-                sample.get("full_name") or "",
-                sample.get("graduating_year"),
-            )
-        else:
-            logger.warning(
-                "Homeroom filtering returned zero students for advisor_id=%s graduating_year=%s",
-                settings.homeroom_advisor_id,
-                settings.target_graduating_year,
+        if not students:
+            raise RuntimeError(
+                "No students matched HOMEROOM_ADVISOR_ID and TARGET_GRADUATING_YEAR. "
+                "Please check advisor id, graduating year, and API token permissions."
             )
 
+        preview = students[:2]
+        logger.info(
+            "Selected %s students for advisor_id=%s target_graduating_year=%s preview=%s",
+            len(students),
+            settings.homeroom_advisor_id,
+            settings.target_graduating_year,
+            [
+                {
+                    "id": p.get("id") or p.get("student_id"),
+                    "name": p.get("full_name") or " ".join(
+                        part for part in [p.get("first_name"), p.get("last_name")] if part
+                    ).strip(),
+                }
+                for p in preview
+            ],
+        )
+
+        student_ids: list[int] = []
         with session_factory() as session:
             for student in students:
-                upsert_student(
-                    session,
-                    student["student_id"],
-                    student.get("full_name") or f"Student {student['student_id']}",
-                    student.get("email"),
-                )
-            counts["students"] = len(students)
+                student_id, full_name, email = normalize_student(student)
+                if student_id is None:
+                    continue
+                student_ids.append(student_id)
+                upsert_student(session, student_id, full_name, email)
+            counts["students"] = len(student_ids)
 
-            if not settings.term_id:
-                logger.error(
-                    "TERM_ID is missing. Skipping term-dependent grade/attendance sync, but student filtering succeeded."
-                )
-            else:
-                local_today = datetime.now(ZoneInfo(settings.report_timezone)).date()
-                used_student_grade_endpoint = True
-                for sid in student_ids:
-                    try:
-                        grades = service.fetch_student_term_grades(sid, settings.term_id)
-                    except FileNotFoundError:
-                        used_student_grade_endpoint = False
-                        break
-                    for grade in grades:
-                        overall_value, overall_text = _normalize_overall(grade.get("overall"))
-                        course_id = grade.get("class_id") or grade.get("course_id")
-                        if course_id is None:
+            local_today = datetime.now(ZoneInfo(settings.report_timezone)).date()
+            used_student_grade_endpoint = True
+            for sid in student_ids:
+                try:
+                    grades = service.fetch_student_term_grades(sid, settings.term_id)
+                except FileNotFoundError:
+                    used_student_grade_endpoint = False
+                    break
+                for grade in grades:
+                    overall_value, overall_text = _normalize_overall(grade.get("overall"))
+                    course_id = grade.get("class_id") or grade.get("course_id")
+                    if course_id is None:
+                        continue
+                    upsert_overall_snapshot(
+                        session,
+                        snapshot_date=local_today,
+                        student_id=sid,
+                        course_id=int(course_id),
+                        course_name=str(grade.get("class_name") or grade.get("course_name") or "Unknown Course"),
+                        overall_value=overall_value,
+                        overall_text=overall_text,
+                    )
+                    counts["snapshots"] += 1
+
+            if not used_student_grade_endpoint:
+                logger.info("Student term grades endpoint returned 404; falling back to class term grades flow.")
+                classes = service.fetch_classes()
+                student_set = set(student_ids)
+                for cls in classes:
+                    class_id = cls.get("id")
+                    if not class_id:
+                        continue
+                    rows = service.fetch_class_term_grades(int(class_id), settings.term_id)
+                    for row in rows:
+                        sid = row.get("student_id")
+                        if sid not in student_set:
                             continue
+                        overall_value, overall_text = _normalize_overall(row.get("overall"))
                         upsert_overall_snapshot(
                             session,
                             snapshot_date=local_today,
-                            student_id=sid,
-                            course_id=int(course_id),
-                            course_name=str(grade.get("class_name") or grade.get("course_name") or "Unknown Course"),
+                            student_id=int(sid),
+                            course_id=int(row.get("class_id") or class_id),
+                            course_name=str(row.get("class_name") or cls.get("name") or row.get("course_name") or "Unknown Course"),
                             overall_value=overall_value,
                             overall_text=overall_text,
                         )
                         counts["snapshots"] += 1
-
-                if not used_student_grade_endpoint:
-                    logger.info("Student term grades endpoint returned 404; falling back to class term grades flow.")
-                    classes = service.fetch_classes()
-                    student_set = set(student_ids)
-                    for cls in classes:
-                        class_id = cls.get("id")
-                        if not class_id:
-                            continue
-                        rows = service.fetch_class_term_grades(int(class_id), settings.term_id)
-                        for row in rows:
-                            sid = row.get("student_id")
-                            if sid not in student_set:
-                                continue
-                            overall_value, overall_text = _normalize_overall(row.get("overall"))
-                            upsert_overall_snapshot(
-                                session,
-                                snapshot_date=local_today,
-                                student_id=int(sid),
-                                course_id=int(row.get("class_id") or class_id),
-                                course_name=str(
-                                    row.get("class_name") or cls.get("name") or row.get("course_name") or "Unknown Course"
-                                ),
-                                overall_value=overall_value,
-                                overall_text=overall_text,
-                            )
-                            counts["snapshots"] += 1
 
             last_behaviour_sync = get_sync_state(session, "last_behaviour_sync")
             page = 1
@@ -194,24 +206,23 @@ def sync() -> None:
             if max_updated:
                 set_sync_state(session, "last_behaviour_sync", max_updated.isoformat())
 
-            if settings.term_id and student_ids:
-                attendance_rows = service.fetch_term_attendance(settings.term_id, student_ids)
-                for row in attendance_rows:
-                    sid = row.get("student_id")
-                    external_id = row.get("id")
-                    if sid is None or external_id is None:
-                        continue
-                    upsert_observation(
-                        session,
-                        type_="attendance",
-                        external_id=str(external_id),
-                        student_id=int(sid),
-                        date_time=parse_datetime(row.get("date") or row.get("recorded_at")),
-                        category=str(row.get("status") or row.get("type") or "attendance"),
-                        content=str(row.get("summary") or row.get("notes") or ""),
-                        source=str(row.get("recorded_by") or "ManageBac"),
-                    )
-                    counts["attendance"] += 1
+            attendance_rows = service.fetch_term_attendance(settings.term_id, student_ids)
+            for row in attendance_rows:
+                sid = row.get("student_id")
+                external_id = row.get("id")
+                if sid is None or external_id is None:
+                    continue
+                upsert_observation(
+                    session,
+                    type_="attendance",
+                    external_id=str(external_id),
+                    student_id=int(sid),
+                    date_time=parse_datetime(row.get("date") or row.get("recorded_at")),
+                    category=str(row.get("status") or row.get("type") or "attendance"),
+                    content=str(row.get("summary") or row.get("notes") or ""),
+                    source=str(row.get("recorded_by") or "ManageBac"),
+                )
+                counts["attendance"] += 1
 
             session.commit()
 
