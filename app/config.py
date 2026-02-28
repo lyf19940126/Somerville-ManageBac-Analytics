@@ -16,8 +16,8 @@ class Settings:
     managebac_token: str
     managebac_base_url: str
     report_timezone: str
-    homeroom_name: str
-    homeroom_id: int | None
+    homeroom_advisor_id: int
+    target_graduating_year: int
     term_id: str
     database_url: str = "sqlite:///data/app.db"
 
@@ -39,27 +39,23 @@ def _require(name: str) -> str:
     return value
 
 
-def _optional_int(name: str) -> int | None:
-    raw = os.getenv(name, "").strip()
-    if not raw:
-        return None
+def _require_int(name: str) -> int:
+    raw = _require(name)
     try:
         return int(raw)
     except ValueError as exc:
-        raise ConfigError(f"Environment variable {name} must be an integer when set") from exc
+        raise ConfigError(f"Environment variable {name} must be an integer") from exc
 
 
-def load_settings(require_term_id: bool = True) -> Settings:
+def load_settings() -> Settings:
     _load_env_once()
-
-    term_id = _require("TERM_ID") if require_term_id else os.getenv("TERM_ID", "").strip()
     return Settings(
         managebac_token=_require("MANAGEBAC_TOKEN"),
         managebac_base_url=_require("MANAGEBAC_BASE_URL").rstrip("/"),
         report_timezone=os.getenv("REPORT_TIMEZONE", "Asia/Shanghai").strip() or "Asia/Shanghai",
-        homeroom_name=os.getenv("HOMEROOM_NAME", "Somerville").strip() or "Somerville",
-        homeroom_id=_optional_int("HOMEROOM_ID"),
-        term_id=term_id,
+        homeroom_advisor_id=_require_int("HOMEROOM_ADVISOR_ID"),
+        target_graduating_year=_require_int("TARGET_GRADUATING_YEAR"),
+        term_id=os.getenv("TERM_ID", "106673").strip(),
     )
 
 

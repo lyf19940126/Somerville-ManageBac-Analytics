@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-from difflib import SequenceMatcher
 from typing import Any
 
 import httpx
@@ -11,8 +10,8 @@ from app.managebac.client import ManageBacClient
 logger = logging.getLogger(__name__)
 
 ENDPOINTS = {
-    "year_groups_list": "/v2/year_groups",
-    "year_group_students": "/v2/year_groups/{id}/students",  # TODO: verify exact path in live API
+    "year_groups_list": "/v2/year-groups",
+    "students_list": "/v2/students",
     "behaviour_notes": "/v2/behavior/notes",
     "classes_list": "/v2/classes",
     "class_term_grades": "/v2/classes/{id}/term_grades",
@@ -25,90 +24,81 @@ class ManageBacService:
     def __init__(self, client: ManageBacClient) -> None:
         self.client = client
 
+    @staticmethod
+    def _extract_list(payload: Any, keys: tuple[str, ...]) -> list[dict[str, Any]]:
+        if isinstance(payload, list):
+            return payload
+        if isinstance(payload, dict):
+            for key in keys:
+                value = payload.get(key)
+                if isinstance(value, list):
+                    return value
+        return []
+
     def fetch_year_groups(self, page: int = 1, per_page: int = 100) -> list[dict[str, Any]]:
         payload = self.client.request(
             "GET",
             ENDPOINTS["year_groups_list"],
             params={"page": page, "per_page": per_page},
         )
-        if isinstance(payload, list):
-            return payload
-        if isinstance(payload, dict):
-            for key in ("data", "year_groups", "items"):
-                if isinstance(payload.get(key), list):
-                    return payload[key]
-        return []
+        return self._extract_list(payload, ("year_groups", "data", "items"))
 
-    def resolve_homeroom_id(self, homeroom_name: str, homeroom_id_override: int | None = None) -> int:
-        if homeroom_id_override is not None:
-            return homeroom_id_override
+    def list_students_for_homeroom(
+        self,
+        advisor_id: int,
+        target_graduating_year: int,
+        per_page: int = 200,
+    ) -> list[dict[str, Any]]:
+        page = 1
+        selected: list[dict[str, Any]] = []
 
-        groups = self.fetch_year_groups(page=1, per_page=200)
-        if not groups:
-            raise RuntimeError(
-                "No year groups returned by API. Set HOMEROOM_ID explicitly or verify ENDPOINTS['year_groups_list']."
+        while True:
+            payload = self.client.request(
+                "GET",
+                ENDPOINTS["students_list"],
+                params={
+                    "homeroom_advisor_ids": advisor_id,
+                    "page": page,
+                    "per_page": per_page,
+                },
             )
+            students = self._extract_list(payload, ("students", "data", "items"))
+            if not students:
+                break
 
-        exact = [g for g in groups if str(g.get("name", "")).strip() == homeroom_name]
-        if len(exact) == 1:
-            return int(exact[0]["id"])
+            for student in students:
+                grad_year = student.get("graduating_year")
+                try:
+                    grad_year_int = int(grad_year)
+                except (TypeError, ValueError):
+                    continue
+                if grad_year_int != target_graduating_year:
+                    continue
+                if student.get("archived") is True:
+                    continue
+                if student.get("graduated_on"):
+                    continue
 
-        contains = [
-            g
-            for g in groups
-            if homeroom_name.lower() in str(g.get("name", "")).strip().lower()
-        ]
-        candidates = exact or contains
-        if not candidates:
-            raise RuntimeError(
-                f"Could not find homeroom '{homeroom_name}'. Set HOMEROOM_ID or adjust HOMEROOM_NAME."
-            )
+                sid = student.get("id") or student.get("student_id")
+                if sid is None:
+                    continue
+                selected.append(
+                    {
+                        "student_id": int(sid),
+                        "full_name": student.get("full_name")
+                        or " ".join(
+                            part for part in [student.get("first_name"), student.get("last_name")] if part
+                        ).strip(),
+                        "email": student.get("email"),
+                        "graduating_year": grad_year_int,
+                    }
+                )
 
-        ranked = sorted(
-            candidates,
-            key=lambda g: SequenceMatcher(
-                None,
-                homeroom_name.lower(),
-                str(g.get("name", "")).lower(),
-            ).ratio(),
-            reverse=True,
-        )
-        chosen = ranked[0]
+            if len(students) < per_page:
+                break
+            page += 1
 
-        if len(ranked) > 1:
-            preview = ", ".join(f"{g.get('name')}({g.get('id')})" for g in ranked[:5])
-            logger.warning("Multiple homeroom candidates found; selected best match. Candidates: %s", preview)
-
-        return int(chosen["id"])
-
-    def fetch_homeroom_students(self, homeroom_id: int) -> list[dict[str, Any]]:
-        payload = self.client.request(
-            "GET",
-            ENDPOINTS["year_group_students"].format(id=homeroom_id),
-        )
-        if isinstance(payload, list):
-            students = payload
-        elif isinstance(payload, dict):
-            students = payload.get("students") or payload.get("data") or payload.get("items") or []
-        else:
-            students = []
-
-        normalized: list[dict[str, Any]] = []
-        for student in students:
-            sid = student.get("id") or student.get("student_id")
-            if sid is None:
-                continue
-            normalized.append(
-                {
-                    "student_id": int(sid),
-                    "full_name": student.get("full_name")
-                    or " ".join(
-                        p for p in [student.get("first_name"), student.get("last_name")] if p
-                    ).strip(),
-                    "email": student.get("email"),
-                }
-            )
-        return normalized
+        return selected
 
     def fetch_behaviour_notes(
         self,
@@ -126,19 +116,11 @@ class ManageBacService:
             params["modified_since"] = modified_since
 
         payload = self.client.request("GET", ENDPOINTS["behaviour_notes"], params=params)
-        if isinstance(payload, list):
-            return payload
-        if isinstance(payload, dict):
-            return payload.get("data") or payload.get("notes") or payload.get("items") or []
-        return []
+        return self._extract_list(payload, ("data", "notes", "items"))
 
     def fetch_classes(self) -> list[dict[str, Any]]:
         payload = self.client.request("GET", ENDPOINTS["classes_list"], params={"per_page": 200})
-        if isinstance(payload, list):
-            return payload
-        if isinstance(payload, dict):
-            return payload.get("data") or payload.get("classes") or payload.get("items") or []
-        return []
+        return self._extract_list(payload, ("data", "classes", "items"))
 
     def fetch_student_term_grades(self, student_id: int, term_id: str) -> list[dict[str, Any]]:
         path = ENDPOINTS["student_term_grades"].format(id=student_id)
@@ -148,11 +130,7 @@ class ManageBacService:
             if exc.response.status_code == 404:
                 raise FileNotFoundError("student term grades endpoint unavailable") from exc
             raise
-        if isinstance(payload, list):
-            return payload
-        if isinstance(payload, dict):
-            return payload.get("data") or payload.get("grades") or payload.get("items") or []
-        return []
+        return self._extract_list(payload, ("data", "grades", "items"))
 
     def fetch_class_term_grades(self, class_id: int, term_id: str) -> list[dict[str, Any]]:
         payload = self.client.request(
@@ -160,18 +138,15 @@ class ManageBacService:
             ENDPOINTS["class_term_grades"].format(id=class_id),
             params={"term_id": term_id},
         )
-        if isinstance(payload, list):
-            return payload
-        if isinstance(payload, dict):
-            return payload.get("data") or payload.get("grades") or payload.get("items") or []
-        return []
+        return self._extract_list(payload, ("data", "grades", "items"))
 
-    def fetch_term_attendance(self, term_id: str, homeroom_id: int) -> list[dict[str, Any]]:
+    def fetch_term_attendance(self, term_id: str, student_ids: list[int]) -> list[dict[str, Any]]:
+        # TODO: verify endpoint params for tenant-specific attendance API.
         try:
             payload = self.client.request(
                 "GET",
                 ENDPOINTS["homeroom_term_attendance"],
-                params={"term_id": term_id, "homeroom_id": homeroom_id},
+                params={"term_id": term_id, "student_ids": student_ids},
             )
         except httpx.HTTPStatusError as exc:
             if exc.response.status_code in (400, 404):
@@ -179,8 +154,4 @@ class ManageBacService:
                 return []
             raise
 
-        if isinstance(payload, list):
-            return payload
-        if isinstance(payload, dict):
-            return payload.get("data") or payload.get("attendance") or payload.get("items") or []
-        return []
+        return self._extract_list(payload, ("data", "attendance", "items"))

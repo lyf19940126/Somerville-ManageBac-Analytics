@@ -4,13 +4,22 @@ from app.managebac.service import ManageBacService
 
 
 def main() -> None:
-    settings = load_settings(require_term_id=False)
+    settings = load_settings()
     client = ManageBacClient(settings.managebac_base_url, settings.managebac_token)
     service = ManageBacService(client)
     try:
-        homeroom_id = service.resolve_homeroom_id(settings.homeroom_name, settings.homeroom_id)
-        students = service.fetch_homeroom_students(homeroom_id)
-        print(f"Resolved homeroom_id={homeroom_id} student_count={len(students)}")
+        students = service.list_students_for_homeroom(
+            advisor_id=settings.homeroom_advisor_id,
+            target_graduating_year=settings.target_graduating_year,
+        )
+        sample = students[0] if students else {}
+        print(
+            "Resolved homeroom student scope: "
+            f"advisor_id={settings.homeroom_advisor_id} "
+            f"graduating_year={settings.target_graduating_year} "
+            f"student_count={len(students)} "
+            f"sample_id={sample.get('student_id')}"
+        )
     finally:
         client.close()
 
