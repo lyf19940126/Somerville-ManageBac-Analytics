@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+httpx
+requests
+python-dotenv
+pydantic
+sqlalchemy
+jinja2
+matplotlib
